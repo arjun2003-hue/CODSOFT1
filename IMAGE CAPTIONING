@@ -1,0 +1,196 @@
+# image_captioning.py
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.layers import Input, Dense, Embedding, LSTM, Dropout, Add
+from tensorflow.keras.models import Model
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+import pickle
+
+# -------------------------
+# 1) Settings / hyperparams
+# -------------------------
+EMBED_DIM = 256
+LSTM_UNITS = 256
+VOCAB_SIZE = 10000   # adjust after tokenizer
+MAX_LEN = 34         # adjust after inspecting dataset
+BATCH_SIZE = 64
+EPOCHS = 20
+FEATURES_DIR = "features/"  # where extracted features will be saved
+
+# -------------------------
+# 2) Feature extractor (ResNet50)
+# -------------------------
+def build_feature_extractor():
+    # ResNet50 without top, output global average pooled features
+    base = ResNet50(weights="imagenet", include_top=False, pooling="avg")
+    input_tensor = base.input
+    output_tensor = base.output  # shape (None, 2048)
+    model = Model(inputs=input_tensor, outputs=output_tensor)
+    return model
+
+def extract_and_save_features(image_paths, extractor, out_dir=FEATURES_DIR):
+    os.makedirs(out_dir, exist_ok=True)
+    for path in image_paths:
+        img = load_img(path, target_size=(224,224))
+        arr = img_to_array(img)
+        arr = np.expand_dims(arr, axis=0)
+        arr = preprocess_input(arr)
+        feats = extractor.predict(arr)   # (1, 2048)
+        fname = os.path.splitext(os.path.basename(path))[0]
+        np.save(os.path.join(out_dir, fname + ".npy"), feats[0])
+
+# -------------------------
+# 3) Load captions and preprocess
+# -------------------------
+def load_captions(captions_file):
+    """
+    captions_file expected format (example for Flickr8k-like):
+    image_name.jpg|A man is running.
+    image_name.jpg|A person running on the track.
+    ...
+    """
+    captions = {}
+    with open(captions_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            img_caption = line.split("|")
+            if len(img_caption) < 2: continue
+            img_name, caption = img_caption[0], "|".join(img_caption[1:])
+            img_key = os.path.splitext(os.path.basename(img_name))[0]
+            # normalize: lowercase and add start/end tokens
+            caption = "startseq " + caption.lower() + " endseq"
+            captions.setdefault(img_key, []).append(caption)
+    return captions
+
+def build_tokenizer(captions_dict, vocab_size=VOCAB_SIZE):
+    all_caps = []
+    for caps in captions_dict.values():
+        all_caps.extend(caps)
+    tokenizer = Tokenizer(num_words=vocab_size, oov_token="unk")
+    tokenizer.fit_on_texts(all_caps)
+    return tokenizer
+
+def max_length(captions_dict):
+    mx = 0
+    for caps in captions_dict.values():
+        for c in caps:
+            mx = max(mx, len(c.split()))
+    return mx
+
+# -------------------------
+# 4) Data generator for training
+# -------------------------
+def data_generator(captions_dict, features_dir, tokenizer, max_len, batch_size=BATCH_SIZE):
+    img_keys = list(captions_dict.keys())
+    n = len(img_keys)
+    while True:
+        np.random.shuffle(img_keys)
+        X1, X2, y = [], [], []
+        for key in img_keys:
+            feats_path = os.path.join(features_dir, key + ".npy")
+            if not os.path.exists(feats_path): 
+                continue
+            img_feat = np.load(feats_path)
+            for cap in captions_dict[key]:
+                seq = tokenizer.texts_to_sequences([cap])[0]
+                for i in range(1, len(seq)):
+                    in_seq, out_seq = seq[:i], seq[i]
+                    in_seq = pad_sequences([in_seq], maxlen=max_len)[0]
+                    out_seq = to_categorical([out_seq], num_classes=tokenizer.num_words)[0]
+                    X1.append(img_feat)
+                    X2.append(in_seq)
+                    y.append(out_seq)
+                    if len(X1) >= batch_size:
+                        yield [np.array(X1), np.array(X2)], np.array(y)
+                        X1, X2, y = [], [], []
+
+# -------------------------
+# 5) Build the captioning model
+# -------------------------
+def build_captioning_model(vocab_size, max_len, embed_dim=EMBED_DIM, lstm_units=LSTM_UNITS):
+    # Image feature extractor branch
+    inputs1 = Input(shape=(2048,))           # ResNet50 pooled features
+    fe1 = Dropout(0.5)(inputs1)
+    fe2 = Dense(embed_dim, activation='relu')(fe1)
+
+    # Sequence branch
+    inputs2 = Input(shape=(max_len,))
+    se1 = Embedding(vocab_size, embed_dim, mask_zero=True)(inputs2)
+    se2 = Dropout(0.5)(se1)
+    se3 = LSTM(lstm_units)(se2)
+
+    # Decoder (combine)
+    decoder1 = Add()([fe2, se3])
+    decoder2 = Dense(lstm_units, activation='relu')(decoder1)
+    outputs = Dense(vocab_size, activation='softmax')(decoder2)
+
+    model = Model(inputs=[inputs1, inputs2], outputs=outputs)
+    model.compile(loss='categorical_crossentropy', optimizer='adam')
+    return model
+
+# -------------------------
+# 6) Inference: generate caption
+# -------------------------
+def generate_caption(model, tokenizer, photo_features, max_len):
+    in_text = "startseq"
+    for _ in range(max_len):
+        sequence = tokenizer.texts_to_sequences([in_text])[0]
+        sequence = pad_sequences([sequence], maxlen=max_len)
+        yhat = model.predict([photo_features.reshape(1,-1), sequence], verbose=0)
+        yhat_index = np.argmax(yhat)
+        word = tokenizer.index_word.get(yhat_index, None)
+        if word is None:
+            break
+        in_text += " " + word
+        if word == "endseq":
+            break
+    final = in_text.split()
+    # remove startseq and endseq
+    final = final[1:-1] if final[-1] == "endseq" else final[1:]
+    return " ".join(final)
+
+# -------------------------
+# 7) Example pipeline (usage)
+# -------------------------
+if __name__ == "__main__":
+    # Paths (change to your dataset)
+    captions_file = "captions.txt"   # formatted as image|caption per line
+    images_dir = "images/"           # full images used to extract features
+
+    # 1) Load captions
+    captions = load_captions(captions_file)
+    print("Loaded captions for", len(captions), "images")
+
+    # 2) Build tokenizer & determine max length
+    tokenizer = build_tokenizer(captions)
+    with open("tokenizer.pkl", "wb") as f:
+        pickle.dump(tokenizer, f)
+    max_len = max_length(captions)
+    vocab_size = min(VOCAB_SIZE, len(tokenizer.word_index) + 1)
+    print("Vocab size:", vocab_size, "Max caption length:", max_len)
+
+    # 3) Extract and save features (run once)
+    extractor = build_feature_extractor()
+    image_paths = [os.path.join(images_dir, img_name + ".jpg") for img_name in captions.keys()]
+    # extract_and_save_features(image_paths, extractor)  # uncomment to run
+
+    # 4) Build model
+    model = build_captioning_model(vocab_size, max_len)
+    model.summary()
+
+    # 5) Train with generator
+    steps = (sum(len(c) for c in captions.values()) * 1) // BATCH_SIZE
+    generator = data_generator(captions, FEATURES_DIR, tokenizer, max_len, batch_size=BATCH_SIZE)
+    # model.fit(generator, epochs=EPOCHS, steps_per_epoch=steps, verbose=1)
+    # model.save("caption_model.h5")
+
+    # 6) Inference example (after training & features extracted)
+    # photo_feat = np.load(os.path.join(FEATURES_DIR, "example_image.npy"))
+    # print(generate_caption(model, tokenizer, photo_feat, max_len))
